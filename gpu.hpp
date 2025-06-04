@@ -204,6 +204,7 @@ enum NumType {
   ku16,
   ku32,
   ku64,
+  kUnknown
 };
 
 /**
@@ -212,15 +213,15 @@ enum NumType {
 inline size_t sizeBytes(const NumType &type) {
   switch (type) {
   case kf16:
-    return sizeof(uint16_t);
+    return sizeof(half);
   case kf32:
     return sizeof(float);
   case kf64:
     return sizeof(double);
   case ki8:
-    return sizeof(uint8_t);
+    return sizeof(int8_t);
   case ki16:
-    return sizeof(uint16_t);
+    return sizeof(int16_t);
   case ki32:
     return sizeof(int32_t);
   case ki64:
@@ -624,28 +625,46 @@ struct Context {
 
   ~Context() {
     LOG(kDefLog, kTrace, "Destroying context");
+
+#ifdef __EMSCRIPTEN__
+    // For WebAssembly, do NOT call processEvents during destruction
+    // This prevents "Asyncify cannot be done during or after runtime exits"
+    LOG(kDefLog, kTrace,
+        "WebAssembly context destruction - skipping processEvents");
+#endif
+
     if (queue) {
       wgpuQueueRelease(queue);
+      queue = nullptr;
     } else {
-      LOG(kDefLog, kTrace, "Queue is null");
+      LOG(kDefLog, kTrace, "Queue already null");
     }
+
     if (device) {
       wgpuDeviceRelease(device);
-      processEvents(instance);
+      device = nullptr;
     } else {
-      LOG(kDefLog, kTrace, "Device is null");
+      LOG(kDefLog, kTrace, "Device already null");
     }
+
     if (adapter) {
       wgpuAdapterRelease(adapter);
-      processEvents(instance);
+      adapter = nullptr;
     } else {
-      LOG(kDefLog, kTrace, "Adapter is null");
+      LOG(kDefLog, kTrace, "Adapter already null");
     }
+
     if (instance) {
+#ifndef __EMSCRIPTEN__
+      // Only call processEvents on native platforms during cleanup
+      processEvents(instance);
+#endif
       wgpuInstanceRelease(instance);
+      instance = nullptr;
     } else {
-      LOG(kDefLog, kTrace, "Instance is null");
+      LOG(kDefLog, kTrace, "Instance already null");
     }
+
     LOG(kDefLog, kTrace, "Context destroyed");
   }
 };
@@ -760,13 +779,27 @@ inline Tensor createTensor(Context &ctx, const Shape &shape, NumType dtype,
 // Overload for double: pack each double into a float (losing precision)
 inline Tensor createTensor(Context &ctx, const Shape &shape, NumType dtype,
                            const double *data) {
-  assert(dtype == kf64); // unsupported: convert to kf32
+  assert(dtype == kf64);
   size_t numElements = size(shape);
-  std::vector<float> packed(numElements);
+  // Each double (8 bytes) will be packed into 2 uint32_t values (2×4 bytes).
+  std::vector<uint32_t> packed(numElements * 2);
   for (size_t i = 0; i < numElements; ++i) {
-    packed[i] = static_cast<float>(data[i]);
+    uint64_t bits;
+    std::memcpy(&bits, &data[i], sizeof(double)); // Extract raw bits.
+    packed[2 * i] = static_cast<uint32_t>(bits & 0xFFFFFFFF);
+    packed[2 * i + 1] = static_cast<uint32_t>(bits >> 32);
   }
-  return createTensor(ctx, shape, kf32, packed.data());
+  // Create a tensor using the core overload that accepts a TensorPool and
+  // WGPUDevice.
+  Tensor tensor =
+      createTensor(ctx.pool, ctx.device, shape, kf64,
+                   WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst |
+                       WGPUBufferUsage_CopySrc);
+
+  wgpuQueueWriteBuffer(ctx.queue, tensor.data.buffer, 0, packed.data(),
+                       packed.size() * sizeof(uint32_t));
+
+  return tensor;
 }
 
 inline Tensor createTensor(Context &ctx, const Shape &shape, NumType dtype,
@@ -968,21 +1001,63 @@ inline void check(bool condition, const char *message,
  * devDescriptor); WGPUDevice device = wait(instance, deviceFuture);
  * @endcode
  */
+#ifdef __EMSCRIPTEN__
+// Global flag to prevent overlapping async operations in WebAssembly
+static std::atomic<bool> asyncOperationInProgress{false};
+#endif
+
 template <typename T> T wait(Context &ctx, std::future<T> &f) {
 #ifdef __EMSCRIPTEN__
-  // Poll until the future is ready.
-  while (f.wait_for(std::chrono::milliseconds(0)) !=
-         std::future_status::ready) {
-    // Yield control to the JS event loop.
-    emscripten_sleep(1);
+  // Check if another async operation is in progress
+  if (asyncOperationInProgress.load()) {
+    LOG(kDefLog, kWarn,
+        "wait(): Another async operation in progress, skipping wait");
+    if constexpr (std::is_void_v<T>) {
+      return; // For void functions, just return
+    } else {
+      return T{}; // Return default-constructed value for non-void types
+    }
   }
-  return f.get();
+
+  // Set the flag before starting async operation
+  asyncOperationInProgress.store(true);
+
+  try {
+    // Poll until the future is ready
+    while (f.wait_for(std::chrono::milliseconds(0)) !=
+           std::future_status::ready) {
+      emscripten_sleep(1);
+    }
+
+    // Handle void vs non-void return types
+    if constexpr (std::is_void_v<T>) {
+      f.get(); // Just call get() without storing result
+      asyncOperationInProgress.store(false);
+      return; // void return
+    } else {
+      T result = f.get();
+      asyncOperationInProgress.store(false);
+      return result;
+    }
+
+  } catch (...) {
+    asyncOperationInProgress.store(false);
+    throw;
+  }
 #else
+  // Native implementation unchanged
   while (f.wait_for(std::chrono::milliseconds(0)) !=
          std::future_status::ready) {
     wgpuInstanceProcessEvents(ctx.instance);
   }
-  return f.get();
+
+  // Handle void vs non-void for native too
+  if constexpr (std::is_void_v<T>) {
+    f.get();
+    return;
+  } else {
+    return f.get();
+  }
 #endif
 }
 
@@ -1506,6 +1581,7 @@ inline void queueWorkDoneCallback(WGPUQueueWorkDoneStatus status,
   // Begin the asynchronous mapping of the readback buffer.
   wgpuBufferMapAsync(cbData->buffer, WGPUMapMode_Read, 0, cbData->bufferSize,
                      mapCallbackInfo);
+  wgpuBufferRelease(cbData->buffer);
 }
 
 /**
@@ -1792,13 +1868,22 @@ inline void toCPU(Context &ctx, Tensor &tensor, NumType dtype, void *output,
     toCPU(ctx, tensor, output, tensor.data.size, sourceOffset);
     break;
 
-  // For double, the tensor was created by packing doubles into floats.
+  // kf64 to reverse bit‐packing of doubles.
   case kf64: {
-    std::vector<float> tmp(numElements);
-    toCPU(ctx, tensor, tmp.data(), tmp.size() * sizeof(float), sourceOffset);
+    // We expect each double to have been packed into 2 uint32_t values.
+    std::vector<uint32_t> tmp(numElements * 2);
+    // Read the packed data (each element is 4 bytes)
+    toCPU(ctx, tensor, tmp.data(), tmp.size() * sizeof(uint32_t), sourceOffset);
     double *dst = static_cast<double *>(output);
     for (size_t i = 0; i < numElements; ++i) {
-      dst[i] = static_cast<double>(tmp[i]);
+      uint32_t low = tmp[2 * i];
+      uint32_t high = tmp[2 * i + 1];
+      // Reassemble the 64-bit raw representation.
+      uint64_t bits = (static_cast<uint64_t>(high) << 32) | low;
+      // Copy the raw bits into a double.
+      double d;
+      std::memcpy(&d, &bits, sizeof(double));
+      dst[i] = d;
     }
     break;
   }
@@ -1905,13 +1990,22 @@ inline void toCPU(Context &ctx, WGPUBuffer buffer, NumType dtype, void *output,
     break;
   }
 
-  // For double, the buffer was written as floats.
+  // kf64 to reverse bit‐packing of doubles.
   case kf64: {
-    std::vector<float> tmp(numElements);
-    toCPU(ctx, buffer, tmp.data(), numElements * sizeof(float), sourceOffset);
+    // We expect each double to have been packed into 2 uint32_t values.
+    std::vector<uint32_t> tmp(numElements * 2);
+    // Read the packed data (each element is 4 bytes)
+    toCPU(ctx, buffer, tmp.data(), tmp.size() * sizeof(uint32_t), sourceOffset);
     double *dst = static_cast<double *>(output);
     for (size_t i = 0; i < numElements; ++i) {
-      dst[i] = static_cast<double>(tmp[i]);
+      uint32_t low = tmp[2 * i];
+      uint32_t high = tmp[2 * i + 1];
+      // Reassemble the 64-bit raw representation.
+      uint64_t bits = (static_cast<uint64_t>(high) << 32) | low;
+      // Copy the raw bits into a double.
+      double d;
+      std::memcpy(&d, &bits, sizeof(double));
+      dst[i] = d;
     }
     break;
   }
@@ -1920,7 +2014,7 @@ inline void toCPU(Context &ctx, WGPUBuffer buffer, NumType dtype, void *output,
   case ki8: {
     size_t packedCount = (numElements + 3) / 4;
     std::vector<int32_t> tmp(packedCount);
-    toCPU(ctx, buffer, tmp.data(), packedCount * sizeof(int32_t), sourceOffset);
+    toCPU(ctx, buffer, tmp.data(), tmp.size() * sizeof(int32_t), sourceOffset);
     int8_t *dst = static_cast<int8_t *>(output);
     for (size_t i = 0; i < numElements; ++i) {
       size_t idx = i / 4;
@@ -2039,16 +2133,20 @@ inline void toGPU(Context &ctx, const half *data, WGPUBuffer buffer,
   toGPU(ctx, static_cast<const void *>(data), buffer, size);
 }
 
-// Overload for double: pack each double into a float (losing precision).
+// Overload for double: bit-pack each double into two 32‑bit unsigned integers.
 inline void toGPU(Context &ctx, const double *data, WGPUBuffer buffer,
                   size_t size) {
   // Number of doubles = size / sizeof(double)
   size_t numElements = size / sizeof(double);
-  std::vector<float> packed(numElements);
+  std::vector<uint32_t> packed(numElements * 2);
   for (size_t i = 0; i < numElements; ++i) {
-    packed[i] = static_cast<float>(data[i]);
+    uint64_t bits;
+    std::memcpy(&bits, &data[i],
+                sizeof(double)); // Reinterpret double as raw bits.
+    packed[2 * i] = static_cast<uint32_t>(bits & 0xFFFFFFFF);
+    packed[2 * i + 1] = static_cast<uint32_t>(bits >> 32);
   }
-  toGPU(ctx, packed.data(), buffer, packed.size() * sizeof(float));
+  toGPU(ctx, packed.data(), buffer, packed.size() * sizeof(uint32_t));
 }
 
 // Overload for int8_t: pack four 8‑bit ints into one 32‑bit integer.
@@ -2062,6 +2160,7 @@ inline void toGPU(Context &ctx, const int8_t *data, WGPUBuffer buffer,
     size_t idx = i / 4;
     size_t shift = (i % 4) * 8;
     packed[idx] |= (static_cast<uint8_t>(data[i]) << shift);
+    // LOG(kDefLog, kInfo, "toGPU: %d %d %d", data[i], packed[idx], idx);
   }
   toGPU(ctx, packed.data(), buffer, packedCount * sizeof(int32_t));
 }
@@ -2157,15 +2256,19 @@ inline void toGPU(Context &ctx, const half *data, Tensor &tensor) {
                        tensor.data.size);
 }
 
-// Overload for double: pack each double into a float (losing precision)
+// Overload for double: bit-pack each double into two 32‑bit unsigned integers.
 inline void toGPU(Context &ctx, const double *data, Tensor &tensor) {
-  size_t numElements = size(tensor.shape);
-  std::vector<float> packed(numElements);
+  size_t numElements = tensor.data.size / sizeof(double);
+  std::vector<uint32_t> packed(numElements * 2);
   for (size_t i = 0; i < numElements; ++i) {
-    packed[i] = static_cast<float>(data[i]);
+    uint64_t bits;
+    std::memcpy(&bits, &data[i],
+                sizeof(double)); // Reinterpret double as raw bits.
+    packed[2 * i] = static_cast<uint32_t>(bits & 0xFFFFFFFF);
+    packed[2 * i + 1] = static_cast<uint32_t>(bits >> 32);
   }
-  wgpuQueueWriteBuffer(ctx.queue, tensor.data.buffer, 0, packed.data(),
-                       tensor.data.size);
+  toGPU(ctx, packed.data(), tensor.data.buffer,
+        packed.size() * sizeof(uint32_t));
 }
 
 // Overload for int8_t: pack four 8‑bit integers into one 32‑bit integer
@@ -2755,7 +2858,6 @@ inline std::future<void> dispatchKernelAsync(Context &ctx, Kernel &kernel) {
   workDoneCallbackInfo.userdata1 = reinterpret_cast<void *>(promise);
   workDoneCallbackInfo.userdata2 = nullptr;
 
-  // IMPORTANT: Pass the address of the callback info structure.
   wgpuQueueOnSubmittedWorkDone(ctx.queue, workDoneCallbackInfo);
 
   return future;
